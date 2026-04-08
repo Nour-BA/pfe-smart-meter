@@ -1,36 +1,52 @@
 import streamlit as st
 import paho.mqtt.client as mqtt
+from pymongo import MongoClient
+import json
 
-st.title("Test de réception MQTT")
+st.title("🚀 Test Final du Pipeline")
 
-# On utilise le session_state pour garder la trace de la connexion
-if 'msg_recu' not in st.session_state:
-    st.session_state.msg_recu = "Aucun message pour l'instant"
+# Initialisation MongoDB
+client_db = MongoClient(st.secrets["MONGO_URI"])
+db = client_db["PFE_SmartCity"]
+collection = db["energy_data"]
+
+# Zone d'affichage en direct
+placeholder = st.empty()
 
 def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        st.success("✅ Streamlit est maintenant connecté à HiveMQ !")
-        client.subscribe("maison/compteur")
-    else:
-        st.error(f"❌ Échec de connexion. Code retour: {rc}")
+    # On force le subscribe ici pour être sûr
+    client.subscribe("maison/compteur")
+    st.sidebar.success("✅ Connecté au Broker et abonné !")
 
 def on_message(client, userdata, msg):
-    payload = msg.payload.decode()
-    st.session_state.msg_recu = payload
-    st.balloons() # Petit effet visuel quand on reçoit la donnée
+    try:
+        # 1. Décodage du message
+        payload = msg.payload.decode()
+        data = json.loads(payload)
+        
+        # 2. Affichage immédiat
+        placeholder.write(f"Dernier message reçu : {data}")
+        
+        # 3. Envoi à MongoDB
+        collection.insert_one(data)
+        st.toast("Donnée stockée dans MongoDB !")
+        
+    except Exception as e:
+        st.error(f"Erreur de traitement : {e}")
 
-# Initialisation automatique
-client = mqtt.Client()
-client.username_pw_set(st.secrets["MQTT_USER"], st.secrets["MQTT_PASS"])
-client.tls_set()
+# Configuration du Client
+if 'mqtt_client' not in st.session_state:
+    c = mqtt.Client(transport="tcp")
+    c.username_pw_set(st.secrets["MQTT_USER"], st.secrets["MQTT_PASS"])
+    c.tls_set()
+    c.on_connect = on_connect
+    c.on_message = on_message
+    
+    c.connect(st.secrets["MQTT_BROKER"], 8883)
+    c.loop_start()
+    st.session_state.mqtt_client = c
 
-try:
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.connect(st.secrets["MQTT_BROKER"], 8883)
-    client.loop_start()
-except Exception as e:
-    st.error(f"Erreur fatale : {e}")
-
-st.write("Dernière donnée reçue :")
-st.info(st.session_state.msg_recu)
+st.write("En attente d'un message depuis le Web Client HiveMQ...")
+if st.button("Vérifier MongoDB"):
+    last_items = list(collection.find().limit(5))
+    st.write(last_items)
