@@ -4,96 +4,86 @@ from pymongo import MongoClient
 import json
 from datetime import datetime
 
-# --- 1. CONFIGURATION DE LA PAGE ---
-st.set_page_config(page_title="Smart Meter PFE", layout="wide")
-st.title("⚡ Dashboard Énergétique : Le Pont de Données")
+# --- CONFIGURATION DE LA PAGE ---
+st.set_page_config(page_title="PFE Smart Meter Dashboard", layout="wide")
 
-# --- 2. RÉCUPÉRATION DES SECRETS (ST.SECRETS) ---
-# Ces valeurs seront configurées dans le menu "Settings > Secrets" de Streamlit Cloud
-try:
-    MONGO_URI = st.secrets["MONGO_URI"]
-    MQTT_BROKER = st.secrets["MQTT_BROKER"]
-    MQTT_USER = st.secrets["MQTT_USER"]
-    MQTT_PASS = st.secrets["MQTT_PASS"]
-except Exception as e:
-    st.error("⚠️ Les Secrets ne sont pas encore configurés ! Allez dans Settings > Secrets.")
-    st.stop()
-
-MQTT_TOPIC = "maison/compteur"
-
-# --- 3. CONNEXION MONGODB ---
+# --- CONNEXION MONGODB ---
 @st.cache_resource
-def get_database():
-    client = MongoClient(MONGO_URI)
-    # Nom de la base : SmartMeter_PFE | Nom de la collection : mesures
-    db = client["SmartMeter_PFE"]
-    return db["mesures"]
+def init_mongodb():
+    # Récupération de l'URI depuis les secrets de Streamlit Cloud
+    client = MongoClient(st.secrets["MONGO_URI"])
+    db = client["PFE_SmartCity"]
+    return db["energy_data"]
 
-db_collection = get_database()
+collection = init_mongodb()
 
-# --- 4. LOGIQUE DU PONT (MQTT -> MONGODB) ---
+# --- LOGIQUE MQTT ---
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        st.session_state.status = "✅ Connecté à HiveMQ"
+        client.subscribe("maison/compteur")
+    else:
+        st.session_state.status = f"❌ Erreur de connexion (code {rc})"
+
 def on_message(client, userdata, msg):
     try:
-        # On décode le message JSON envoyé par le compteur (ESP32 ou simulateur)
-        payload = json.loads(msg.payload.decode())
+        # Décodage du JSON envoyé par l'ESP32
+        data = json.loads(msg.payload.decode())
+        # Ajout d'un timestamp pour l'historique
+        data["timestamp"] = datetime.now()
         
-        # On ajoute la date et l'heure précise de réception
-        payload["timestamp"] = datetime.now()
+        # Insertion dans MongoDB Atlas
+        collection.insert_one(data)
         
-        # --- ACTION DU PONT : INSERTION DANS LA BASE DE DONNÉES ---
-        db_collection.insert_one(payload)
-        print("Donnée enregistrée avec succès !")
-        
+        # Mise à jour de l'affichage en temps réel
+        st.session_state.last_data = data
     except Exception as e:
-        print(f"Erreur lors du traitement du message : {e}")
+        print(f"Erreur traitement message: {e}")
 
-# Configuration du client MQTT
-# Utilisation de la version 1 du callback pour la compatibilité HiveMQ
-mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
-mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
-mqtt_client.tls_set() # Obligatoire pour HiveMQ Cloud (SSL)
-mqtt_client.on_message = on_message
+# --- INITIALISATION DU CLIENT MQTT ---
+if 'mqtt_client' not in st.session_state:
+    client = mqtt.Client()
+    # Utilisation des secrets pour HiveMQ
+    client.username_pw_set(st.secrets["MQTT_USER"], st.secrets["MQTT_PASS"])
+    client.tls_set() # Sécurité obligatoire pour HiveMQ Cloud
+    
+    client.on_connect = on_connect
+    client.on_message = on_message
+    
+    try:
+        client.connect(st.secrets["MQTT_BROKER"], 8883)
+        client.loop_start()
+        st.session_state.mqtt_client = client
+    except Exception as e:
+        st.error(f"Impossible de se connecter au Broker: {e}")
 
-# --- 5. INTERFACE ET BOUTONS ---
-col1, col2 = st.columns(2)
+# --- INTERFACE STREAMLIT ---
+st.title("⚡ Système de Monitoring Énergétique (PFE)")
+st.write(f"Statut du serveur : **{st.session_state.get('status', 'Initialisation...')}**")
 
-with col1:
-    st.info("📡 **Connexion au Broker**")
-    if st.button("🚀 ACTIVER LE PONT", use_container_width=True):
-        try:
-            mqtt_client.connect(MQTT_BROKER, 8883)
-            mqtt_client.subscribe(MQTT_TOPIC)
-            mqtt_client.loop_start() # Lance l'écoute en arrière-plan
-            st.success("✅ Le pont est actif ! Il écoute et enregistre les données.")
-        except Exception as e:
-            st.error(f"Échec de connexion : {e}")
+col1, col2, col3 = st.columns(3)
 
-with col2:
-    st.info("📊 **Affichage**")
-    if st.button("🔄 ACTUALISER LES DONNÉES", use_container_width=True):
-        st.rerun()
+# Affichage des dernières valeurs reçues
+if 'last_data' in st.session_state:
+    d = st.session_state.last_data
+    col1.metric("Tension (V)", f"{d.get('v', 0)} V")
+    col2.metric("Courant (A)", f"{d.get('i', 0)} A")
+    col3.metric("Puissance (W)", f"{d.get('p', 0)} W")
+else:
+    st.info("En attente des premières données de l'ESP32...")
 
 st.divider()
 
-# --- 6. VISUALISATION DES DONNÉES DEPUIS MONGODB ---
-st.subheader("📋 Dernières mesures extraites de la base de données")
+# --- PARTIE ANALYSE ---
+st.subheader("📊 Historique récent (MongoDB)")
+if st.button("Actualiser les données"):
+    # Récupère les 10 dernières entrées de MongoDB
+    cursor = collection.find().sort("timestamp", -1).limit(10)
+    data_list = list(cursor)
+    if data_list:
+        st.table(data_list)
+    else:
+        st.warning("Aucune donnée trouvée dans la base.")
 
-# On récupère les 10 dernières entrées triées par date
-cursor = db_collection.find().sort("timestamp", -1).limit(10)
-data_list = list(cursor)
-
-if data_list:
-    # Nettoyage de l'ID MongoDB pour l'affichage tableau
-    for doc in data_list:
-        doc.pop('_id', None)
-        if "timestamp" in doc:
-            doc["timestamp"] = doc["timestamp"].strftime("%H:%M:%S")
-
-    # Affichage du tableau
-    st.dataframe(data_list, use_container_width=True)
-
-    # Graphique de puissance (clé 'p' dans ton JSON)
-    puissances = [float(d.get('p', 0)) for d in reversed(data_list)]
-    st.line_chart(puissances)
-else:
-    st.warning("Base de données vide. Activez le pont et envoyez une donnée sur HiveMQ.")
+st.sidebar.write("### Paramètres")
+st.sidebar.info("Le pont tourne en arrière-plan. Les données de l'ESP32 sont automatiquement envoyées vers MongoDB Atlas.")
