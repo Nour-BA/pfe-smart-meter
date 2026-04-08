@@ -3,7 +3,7 @@ import paho.mqtt.client as mqtt
 from pymongo import MongoClient
 import os
 
-st.title("🛠 Debug du Pont IoT")
+st.title("🛠 Debug du Pont IoT...")
 
 # 1. Test des Secrets
 try:
